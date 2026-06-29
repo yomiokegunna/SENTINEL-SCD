@@ -1,0 +1,3 @@
+jdbc:postgresql://dev-postgres-db:5432/omop_ibd
+org.postgresql.Driver
+/opt/nifi/nifi-current/lib/dev-postgres-db

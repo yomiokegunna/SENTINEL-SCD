@@ -1,0 +1,25 @@
+1= terminal ileum
+2= caecum
+3= ascendens
+4= transversum
+5= descendens
+6= sigmoid
+7= rectum/anus
+8= upper GI
+9= neoterminal ileum
+10= anastomosis
+
+
+
+
+1= L1 (ileal)
+2= L2 (colonic)
+3= L3 (ileocolonic)
+4= L4 (upper GI)
+
+1=disease location
+2=disease behaviour (inflamatory, stricture)
+
+
+format(toDate(/stop_date_merged, "dd-MM-yyyy"), 'yyyy-MM-dd')
+format(toDate(/start_date_merged, "dd-MM-yyyy"), 'yyyy-MM-dd')

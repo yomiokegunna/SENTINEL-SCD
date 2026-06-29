@@ -1,0 +1,21 @@
+Ever hospitalised
+0= No
+1= Yes
+
+
+Severity indication for hospitalisation
+1= flare
+2= surgery
+3= flare+surgery
+4= EIM
+
+
+1= severity grouping
+2=periods of hospitalisation
+
+severe
+yes
+mild
+no
+moderate
+yes
