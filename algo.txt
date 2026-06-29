@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Submit a PoC batch of federated classification tasks to a Vantage6 collaboration.
+
+This script is intentionally organized around top-level constants so it can be reused
+across projects with minimal edits.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import time
+from dataclasses import dataclass
+from typing import Any
+from getpass import getpass
+
+from vantage6.client import Client
+
+# ============================================================================
+# Connection and credentials (can be overridden with environment variables)
+# ============================================================================
+config = {
+    'server_url': 'https://vantage6server.fresh-um.src.surf-hosted.nl',
+    'server_port': 443,
+    'server_api': '/serverapi',
+    'username': 'yomi-sananet',
+    'password': '######',
+    'organization_key': '/home/yokegunna/.local/share/vantage6/node/privkey_SANANET.pem'
+}
+
+
+
+V6_SERVER_HOST = 'https://vantage6server.fresh-um.src.surf-hosted.nl'
+V6_SERVER_PORT = 443
+V6_API_PATH =  "/serverapi"
+
+V6_USERNAME = 'yomi-sananet'
+V6_PASSWORD = getpass("enter password")
+V6_MFA_CODE = os.getenv("V6_MFA_CODE", "")
+V6_USER_PRIVATE_KEY = '/home/yokegunna/.local/share/vantage6/node/privkey_SANANET.pem'
+
+# ============================================================================
+# Collaboration, image, runtime
+# ============================================================================
+V6_COLLABORATION_NAME = os.getenv("V6_COLLABORATION_NAME", "FRESH")
+ALGO_IMAGE = "ghcr.io/strata-fit/strata-fit-v6-sklearn-linear-py@sha256:31e1c99ecf8cdea3dc02c14c18621b06f3525231bdbbf0476ede159690b3be3f"
+DATABASE_LABEL = "default"
+
+# Optional: force one specific master organization id.
+# Keep at 0 to auto-try organizations from the collaboration.
+V6_MASTER_ORG_ID = 0 # int(os.getenv("V6_MASTER_ORG_ID", "0"))
+
+# Optional: limit number of organizations (0 means all in collaboration).
+V6_MAX_ORGANIZATIONS = 0 # int(os.getenv("V6_MAX_ORGANIZATIONS", "0"))
+
+NUM_ROUNDS = int(os.getenv("V6_NUM_ROUNDS", "1"))
+N_LOCAL_EPOCHS = int(os.getenv("V6_N_LOCAL_EPOCHS", "1"))
+STRATEGY_NAME = os.getenv("V6_STRATEGY_NAME", "fed_avg")
+TASK_TIMEOUT_S = int(os.getenv("V6_TASK_TIMEOUT_S", "3600"))
+STATUS_POLL_INTERVAL_S = int(os.getenv("V6_STATUS_POLL_INTERVAL_S", "5"))
+
+# ============================================================================
+# Data schema constants (Yomi's 4 classification problems)
+# ============================================================================
+PREDICTORS = [
+    "GENDER_BINARY",
+    "PATIENT_AGE",
+    "HYDROXYUREA_BINARY",
+    "PROVIDER_LEVEL_CODED",
+    "PROVIDER_OWNERSHIP_CODED",
+]
+CLASSES = [0, 1]
+
+
+@dataclass(frozen=True)
+class ClassificationProblem:
+    name: str
+    outcome: str
+    model_kwargs: dict[str, Any]
+CLASSIFICATION_PROBLEMS: list[ClassificationProblem] = [
+    ClassificationProblem(
+        name="scd_high_utilisation_l2_lbfgs",
+        outcome="HIGH_UTILISATION",
+        model_kwargs={
+            "penalty": "l2",
+            "solver": "lbfgs",
+            "class_weight": "balanced",
+            "C": 1.0,
+            "max_iter": 300,
+        },
+    ),
+]
+
+TERMINAL_STATUSES = {
+    "completed",
+    "crashed",
+    "failed",
+    "cancelled",
+    "non-existing Docker image",
+}
+
+
+def _is_placeholder(value: str) -> bool:
+    value = value.strip()
+    return value.startswith("<") and value.endswith(">")
+
+
+def _list_data(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return data
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _decode_result(value: Any) -> Any:
+    if value is None or isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {"raw": str(value)}
+
+    try:
+        return json.loads(base64.b64decode(value).decode("utf-8"))
+    except Exception:
+        pass
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return {"raw": value}
+
+
+def _wait_for_terminal(client: Client, task_id: int, timeout_s: int) -> str:
+    status = None
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        current = client.task.get(task_id).get("status")
+        if current != status:
+            print(f"task {task_id} status: {current}")
+            status = current
+        if current in TERMINAL_STATUSES:
+            return current
+        time.sleep(STATUS_POLL_INTERVAL_S)
+    raise TimeoutError(f"Task {task_id} did not finish before timeout ({timeout_s}s)")
+
+
+def _assert_required_constants() -> None:
+    required = {
+        "V6_SERVER_HOST": V6_SERVER_HOST,
+        "V6_USERNAME": V6_USERNAME,
+        "V6_PASSWORD": V6_PASSWORD,
+        "ALGO_IMAGE": ALGO_IMAGE,
+        "V6_COLLABORATION_NAME": V6_COLLABORATION_NAME,
+        "DATABASE_LABEL": DATABASE_LABEL,
+    }
+    missing = [
+        key
+        for key, value in required.items()
+        if not str(value).strip() or _is_placeholder(str(value))
+    ]
+    if missing:
+        raise ValueError(
+            "Missing required configuration values: "
+            + ", ".join(missing)
+            + ". Fill the constants at the top of this script or export env vars."
+        )
+
+
+def _get_collaboration_id(client: Client, collaboration_name: str) -> int:
+    collaborations = _list_data(client.collaboration.list())
+    for collab in collaborations:
+        if collab.get("name") == collaboration_name:
+            return int(collab["id"])
+
+    available = ", ".join(sorted(str(c.get("name")) for c in collaborations if c.get("name")))
+    raise RuntimeError(
+        f"Collaboration '{collaboration_name}' not found. "
+        f"Available collaborations: {available or '(none)'}"
+    )
+
+
+def _get_collaboration_org_ids(client: Client, collab_id: int) -> list[int]:
+    orgs = _list_data(client.organization.list(collaboration=collab_id))
+    org_ids = [int(org["id"]) for org in orgs if org.get("id") is not None]
+
+    if not org_ids:
+        raise RuntimeError(
+            f"No organizations found in collaboration id={collab_id}. "
+            "Please add organizations/nodes to the collaboration first."
+        )
+
+    if V6_MAX_ORGANIZATIONS > 0:
+        # TODO [2, 3]
+        org_ids = [2, 3]#org_ids[:V6_MAX_ORGANIZATIONS]
+    return org_ids
+
+
+def _create_task_with_master_fallback(
+    *,
+    client: Client,
+    collab_id: int,
+    candidate_master_org_ids: list[int],
+    task_name: str,
+    input_: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    errors: list[str] = []
+    for master_org_id in candidate_master_org_ids:
+        payload = client.task.create(
+            collaboration=collab_id,
+            organizations=[master_org_id],
+            name=task_name,
+            image=ALGO_IMAGE,
+            description=task_name,
+            input_=input_,
+            databases=[{"label": DATABASE_LABEL}],
+        )
+        if isinstance(payload, dict) and payload.get("id") is not None:
+            return payload, master_org_id
+        errors.append(f"org={master_org_id}: {payload}")
+
+    joined = "; ".join(errors) if errors else "no task responses captured"
+    raise RuntimeError(
+        f"Could not create task '{task_name}' with any candidate master org ({joined})"
+    )
+
+
+def _build_input(problem: ClassificationProblem, org_ids: list[int]) -> dict[str, Any]:
+    return {
+        "master": True,
+        "method": "master_flower",
+        "kwargs": {
+            "org_ids": org_ids,
+            "predictors": PREDICTORS,
+            "outcome": problem.outcome,
+            "classes": CLASSES,
+            "database_label": DATABASE_LABEL,
+            "num_rounds": NUM_ROUNDS,
+            "n_local_epochs": N_LOCAL_EPOCHS,
+            "strategy_name": STRATEGY_NAME,
+            "strategy_kwargs": {},
+            "model_kwargs": problem.model_kwargs,
+        },
+    }
+
+
+def _fetch_result_dict(client: Client, task_id: int) -> dict[str, Any]:
+    rows = _list_data(client.result.from_task(task_id))
+    if not rows:
+        raise RuntimeError(f"Task {task_id} has no result rows")
+
+    decoded = _decode_result(rows[0].get("result"))
+    print(type(decoded))
+    if isinstance(decoded, dict) and decoded.get("ok") is False:
+        raise RuntimeError(f"Task {task_id} returned an error envelope: {decoded}")
+    if not isinstance(decoded, dict):
+        raise RuntimeError(f"Task {task_id} result is not a dict: {decoded}")
+
+    missing = {"model_attributes", "history"}.difference(decoded.keys())
+    if missing:
+        raise RuntimeError(f"Task {task_id} result missing keys: {sorted(missing)}")
+
+    history = decoded.get("history")
+    if not isinstance(history, list):
+        raise RuntimeError(f"Task {task_id} history is not a list")
+    return decoded
+
+
+def main() -> None:
+    _assert_required_constants()
+
+    print("Connecting to Vantage6 server...")
+    client = Client(V6_SERVER_HOST, V6_SERVER_PORT, V6_API_PATH)
+    if V6_MFA_CODE.strip():
+        client.authenticate(V6_USERNAME, V6_PASSWORD, mfa_code=V6_MFA_CODE)
+    else:
+        client.authenticate(V6_USERNAME, V6_PASSWORD)
+
+    if V6_USER_PRIVATE_KEY.strip():
+        client.setup_encryption(V6_USER_PRIVATE_KEY)
+    else:
+        client.setup_encryption(None)
+
+    collab_id = _get_collaboration_id(client, V6_COLLABORATION_NAME)
+    org_ids = _get_collaboration_org_ids(client, collab_id)
+    print(
+        f"Using collaboration '{V6_COLLABORATION_NAME}' (id={collab_id}), "
+        f"organizations={org_ids}, image='{ALGO_IMAGE}'"
+    )
+
+    if V6_MASTER_ORG_ID > 0:
+        if V6_MASTER_ORG_ID not in org_ids:
+            raise ValueError(
+                f"V6_MASTER_ORG_ID={V6_MASTER_ORG_ID} is not in collaboration org ids {org_ids}"
+            )
+        candidate_master_org_ids = [V6_MASTER_ORG_ID]
+    else:
+        candidate_master_org_ids = list(org_ids)
+
+    run_tag = time.strftime("%Y%m%d-%H%M%S")
+    summaries: list[dict[str, Any]] = []
+
+    for index, problem in enumerate(CLASSIFICATION_PROBLEMS, start=1):
+        task_name = f"fresh-{index:02d}-{problem.name}-{run_tag}"
+        input_ = _build_input(problem, org_ids)
+
+        print(
+            f"\nSubmitting {index}/{len(CLASSIFICATION_PROBLEMS)}: "
+            f"{task_name} (outcome={problem.outcome})"
+        )
+        task, master_org_id = _create_task_with_master_fallback(
+            client=client,
+            collab_id=collab_id,
+            candidate_master_org_ids=candidate_master_org_ids,
+            task_name=task_name,
+            input_=input_,
+        )
+        task_id = int(task["id"])
+        print(f"Created task id={task_id} master_org_id={master_org_id}")
+
+        status = _wait_for_terminal(client, task_id, TASK_TIMEOUT_S)
+        if status != "completed":
+            raise RuntimeError(f"Task {task_id} finished with status '{status}'")
+
+        result = _fetch_result_dict(client, task_id)
+        model_attributes = result.get("model_attributes", {})
+        history = result.get("history", [])
+        summaries.append(
+            {
+                "task_id": task_id,
+                "task_name": task_name,
+                "outcome": problem.outcome,
+                "status": status,
+                "rounds": len(history),
+                "has_classes": "classes_" in model_attributes,
+            }
+        )
+        print(
+            f"task {task_id} completed: rounds={len(history)} "
+            f"model_keys={sorted(model_attributes.keys())}"
+        )
+
+    print("\nAll classification tasks completed successfully.\nSummary:")
+    for row in summaries:
+        print(
+            f"- task_id={row['task_id']} status={row['status']} "
+            f"outcome={row['outcome']} rounds={row['rounds']} "
+            f"has_classes={row['has_classes']}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+ 
